@@ -9,9 +9,10 @@ else()
     find_path(ASIO_INCLUDE_DIR
         NAMES asio.hpp
         PATHS
+            ${CMAKE_PREFIX_PATH}/include
+            ${CMAKE_INSTALL_PREFIX}/include
             /usr/local/include
             /usr/include
-            ${CMAKE_INSTALL_PREFIX}/include
         DOC "Path to ASIO headers"
     )
 
@@ -62,6 +63,7 @@ target_include_directories(mooncake_common PUBLIC
 target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
     jsoncpp
+    yalantinglibs::yalantinglibs
 )
 
 if (BUILD_SHARED_LIBS)
