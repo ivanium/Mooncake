@@ -522,8 +522,13 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         uint64_t offset = 0;
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
+            LOG(ERROR) << "Failed to open segment"
+                       << " endpoint='" << handle.transport_endpoint_ << "'"
+                       << " replica_idx=" << i
+                       << " num_replicas=" << replicas.size()
+                       << " op_code="
+                       << (op_code == TransferRequest::READ ? "READ" : "WRITE")
+                       << " call=submit_batch";
             return std::nullopt;
         }
         for (auto slice : slices) {
@@ -559,7 +564,12 @@ TransferSubmitter::submit_batch_get_offload_object(
         auto pointer = pointers[i];
         SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+            LOG(ERROR) << "Failed to open segment"
+                       << " endpoint='" << transfer_engine_addr << "'"
+                       << " key_idx=" << i
+                       << " num_keys=" << keys.size()
+                       << " key='" << key << "'"
+                       << " call=submit_batch_get_offload_object";
             return std::nullopt;
         }
         const auto& slice = batched_slices.find(key)->second;
@@ -663,8 +673,14 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
 
     if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment for endpoint='"
-                   << handle.transport_endpoint_ << "'";
+        LOG(ERROR) << "Failed to open segment"
+                   << " endpoint='" << handle.transport_endpoint_ << "'"
+                   << " buffer_address=0x" << std::hex
+                   << handle.buffer_address_ << std::dec
+                   << " num_slices=" << slices.size()
+                   << " op_code="
+                   << (op_code == TransferRequest::READ ? "READ" : "WRITE")
+                   << " call=submitTransferEngineOperation";
         return std::nullopt;
     }
 

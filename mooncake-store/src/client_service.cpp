@@ -1571,6 +1571,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             }
         }
 
+        std::string failed_endpoint;
+        size_t failed_replica_idx = 0;
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
@@ -1581,6 +1583,9 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                 if (!submit_result) {
                     failure_context = "Failed to submit transfer for replica " +
                                       std::to_string(replica_idx);
+                    failed_replica_idx = replica_idx;
+                    failed_endpoint = replica.get_memory_descriptor()
+                                          .buffer_descriptor.transport_endpoint_;
                     all_transfers_submitted = false;
                     break;
                 }
@@ -1592,6 +1597,11 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 
         if (!all_transfers_submitted) {
             LOG(ERROR) << "Transfer submission failed for key " << op.key
+                       << " endpoint='" << failed_endpoint << "'"
+                       << " replica_idx=" << failed_replica_idx
+                       << " num_replicas=" << op.replicas.size()
+                       << " value_length=" << op.value_length
+                       << " num_slices=" << op.slices.size()
                        << ": " << failure_context;
             op.SetError(ErrorCode::TRANSFER_FAIL, failure_context);
             op.pending_transfers.clear();
@@ -1948,6 +1958,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         }
         if (!all_transfers_submitted) {
             LOG(ERROR) << "Transfer submission failed for key " << op.key
+                       << " (merged_batch)"
+                       << " segment_endpoint='" << seg_to_op.first << "'"
+                       << " num_replicas=" << op.replicas.size()
+                       << " num_batched_slices=" << op.batched_slices.size()
                        << ": " << failure_context;
             merged_op.SetError(ErrorCode::TRANSFER_FAIL, failure_context);
             merged_op.pending_transfers.clear();
