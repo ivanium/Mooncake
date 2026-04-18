@@ -1616,34 +1616,77 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             continue;
         }
 
-        bool all_transfers_succeeded = true;
-        ErrorCode first_error = ErrorCode::OK;
-        size_t failed_transfer_idx = 0;
+        size_t num_succeeded = 0;
+        ErrorCode last_error = ErrorCode::OK;
+        std::vector<std::pair<size_t, ErrorCode>> failed_replicas;
+        std::vector<size_t> memory_replica_indices;
+        memory_replica_indices.reserve(op.replicas.size());
+        for (size_t replica_idx = 0; replica_idx < op.replicas.size();
+             ++replica_idx) {
+            if (op.replicas[replica_idx].is_memory_replica()) {
+                memory_replica_indices.push_back(replica_idx);
+            }
+        }
 
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
             ErrorCode transfer_result = op.pending_transfers[i].get();
-            if (transfer_result != ErrorCode::OK) {
-                if (all_transfers_succeeded) {
-                    // Record the first error for reporting
-                    first_error = transfer_result;
-                    failed_transfer_idx = i;
-                    all_transfers_succeeded = false;
-                }
+            if (transfer_result == ErrorCode::OK) {
+                num_succeeded++;
+            } else {
+                last_error = transfer_result;
+                size_t replica_idx =
+                    i < memory_replica_indices.size()
+                        ? memory_replica_indices[i]
+                        : i;
+                failed_replicas.emplace_back(replica_idx, transfer_result);
                 // Continue waiting for all transfers to avoid resource leaks
             }
         }
 
-        if (all_transfers_succeeded) {
-            VLOG(1) << "All transfers completed successfully for key "
-                    << op.key;
+        // Build a readable failed-replica summary (endpoint + error) for logs.
+        auto build_failed_replica_summary = [&]() -> std::string {
+            std::string s;
+            for (const auto& [idx, err] : failed_replicas) {
+                if (!s.empty()) s += ", ";
+                s += "replica[" + std::to_string(idx) + "]";
+                if (idx < op.replicas.size() &&
+                    op.replicas[idx].is_memory_replica()) {
+                    s += "(endpoint='" +
+                         op.replicas[idx]
+                             .get_memory_descriptor()
+                             .buffer_descriptor.transport_endpoint_ +
+                         "')";
+                }
+                s += "=" + toString(err);
+            }
+            return s;
+        };
+
+        // Quorum semantics: if at least one replica succeeded, the put
+        // transfer phase is considered successful and finalization proceeds.
+        // Caveat: master-side replica tracking still assumes all-or-nothing.
+        // Tracking per-replica final state at the master is a follow-up.
+        if (num_succeeded > 0) {
+            if (failed_replicas.empty()) {
+                VLOG(1) << "All transfers completed successfully for key "
+                        << op.key;
+            } else {
+                LOG(WARNING)
+                    << "WaitForTransfers partial success for key " << op.key
+                    << " quorum=" << num_succeeded << "/"
+                    << op.pending_transfers.size()
+                    << " failed_replicas=[" << build_failed_replica_summary()
+                    << "]";
+            }
             // Transfer phase successful - continue to finalization
             // Note: Don't mark as SUCCESS yet, need to complete finalization
         } else {
-            std::string error_context =
-                "Transfer " + std::to_string(failed_transfer_idx) + " failed";
-            LOG(ERROR) << "Transfer failed for key " << op.key << ": "
-                       << toString(first_error) << " (" << error_context << ")";
-            op.SetError(first_error, error_context);
+            LOG(ERROR) << "Transfer failed for key " << op.key
+                       << " quorum=0/" << op.pending_transfers.size()
+                       << " (all replicas failed)"
+                       << " failed_replicas=[" << build_failed_replica_summary()
+                       << "]";
+            op.SetError(last_error, "All replicas failed");
         }
     }
 }
