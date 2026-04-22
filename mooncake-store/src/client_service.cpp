@@ -1162,9 +1162,7 @@ bool Client::RedirectToHotCache(const std::string& key,
         return false;
     }
 
-    mem_desc.buffer_descriptor.transport_endpoint_ =
-        (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
-                                               : local_hostname_;
+    mem_desc.buffer_descriptor.transport_endpoint_ = GetSegmentEndpoint();
     mem_desc.buffer_descriptor.buffer_address_ =
         reinterpret_cast<uintptr_t>(blk->addr);
     return true;
@@ -2180,11 +2178,11 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
-        if (metadata_connstring_ == P2PHANDSHAKE) {
-            segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
-        } else {
-            segment.te_endpoint = local_hostname_;
-        }
+        // For P2P handshake mode, publish the actual transport endpoint that
+        // was negotiated by the transfer engine. Otherwise, keep the logical
+        // hostname so metadata backends (HTTP/etcd/redis) can resolve the
+        // segment by name.
+        segment.te_endpoint = GetSegmentEndpoint();
 
         auto mount_result = master_client_.MountSegment(segment);
         if (!mount_result) {
@@ -3145,10 +3143,7 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     }
     const auto replica_transfer_endpoint =
         replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
-    if (metadata_connstring_ == P2PHANDSHAKE) {
-        return replica_transfer_endpoint == GetTransportEndpoint();
-    }
-    return local_hostname_ == replica_transfer_endpoint;
+    return GetSegmentEndpoint() == replica_transfer_endpoint;
 }
 
 }  // namespace mooncake

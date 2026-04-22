@@ -3451,6 +3451,50 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
 }
 
+TEST_F(MasterServiceTest, OffloadHeartbeatRoutesToMemoryOwnerClient) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    std::unique_ptr<MasterService> service_(new MasterService(config));
+
+    const UUID writer_client_id = generate_uuid();
+    const UUID owner_client_id = generate_uuid();
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    auto owner_segment = MakeSegment("owner-segment", buffer, size);
+
+    ASSERT_TRUE(service_->MountSegment(owner_segment, owner_client_id)
+                    .has_value());
+    ASSERT_TRUE(service_->MountLocalDiskSegment(writer_client_id, true)
+                    .has_value());
+    ASSERT_TRUE(service_->MountLocalDiskSegment(owner_client_id, true)
+                    .has_value());
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    replicate_config.preferred_segment = owner_segment.name;
+
+    const std::string key = "offload-owner-routed-key";
+    auto put_start_result =
+        service_->PutStart(writer_client_id, key, 1024, replicate_config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(writer_client_id, key, ReplicaType::MEMORY)
+            .has_value());
+
+    auto writer_heartbeat =
+        service_->OffloadObjectHeartbeat(writer_client_id, true);
+    ASSERT_TRUE(writer_heartbeat.has_value());
+    EXPECT_TRUE(writer_heartbeat->empty());
+
+    auto owner_heartbeat =
+        service_->OffloadObjectHeartbeat(owner_client_id, true);
+    ASSERT_TRUE(owner_heartbeat.has_value());
+    ASSERT_EQ(owner_heartbeat->size(), 1);
+    auto owner_it = owner_heartbeat->find(key);
+    ASSERT_NE(owner_it, owner_heartbeat->end());
+    EXPECT_EQ(owner_it->second, 1024);
+}
+
 TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
