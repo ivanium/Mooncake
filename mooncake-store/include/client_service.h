@@ -470,8 +470,19 @@ class Client {
         return metrics_ ? &metrics_->ssd_metric : nullptr;
     }
 
-    [[nodiscard]] std::string GetTransportEndpoint() {
+    [[nodiscard]] std::string GetTransportEndpoint() const {
         return transfer_engine_->getLocalIpAndPort();
+    }
+
+    /**
+     * @brief Get the endpoint address for segment operations.
+     * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
+     *         For other modes, returns the logical local hostname used for
+     *         segment registration.
+     */
+    [[nodiscard]] std::string GetSegmentEndpoint() const {
+        return metadata_connstring_ == P2PHANDSHAKE ? GetTransportEndpoint()
+                                                    : local_hostname_;
     }
 
     // Return sorted NUMA node IDs that have at least one RDMA NIC.
