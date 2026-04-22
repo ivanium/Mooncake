@@ -571,9 +571,12 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
+    // update_metadata=true: push the ClientBuffer's address range to the
+    // metadata server so remote clients can resolve it during offload reads
+    // (required for HTTP/etcd metadata mode; see kvcache-ai/Mooncake#1939).
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, false);
+        kWildcardLocation, false, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
