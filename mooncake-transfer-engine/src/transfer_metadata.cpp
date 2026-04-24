@@ -17,8 +17,10 @@
 #include <json/value.h>
 
 #include <cassert>
+#include <chrono>
 #include <set>
 #include <algorithm>
+#include <thread>
 
 #include "common.h"
 #include "config.h"
@@ -834,6 +836,12 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
     // TODO: save to local cache
     // auto peer_desc = decodeSegmentDesc(peer_json,
     // peer_json["name"].asString());
+    //
+    // Note: the handshake listener is single-threaded
+    // (SocketHandShakePlugin::listener_ accepts and dispatches connections
+    // sequentially), so this callback MUST return quickly. Do not block or
+    // retry here -- returning ERR_METADATA tells the peer "try again";
+    // the retry lives on the caller's side in getSegmentDesc().
     std::shared_ptr<SegmentDesc> local_desc;
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
@@ -869,8 +877,24 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
         if (ret) {
             return nullptr;
         }
-        ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
-                                                  peer_json);
+
+        // Bug fix: the first handshake attempt can lose to a startup race
+        // when 32+ clients come up concurrently (peer's daemon accepted the
+        // TCP connect but hadn't yet populated its LOCAL_SEGMENT_ID map). A
+        // single failure here means the caller (workerpool) marks every RDMA
+        // slice to that peer as failed and PutEnd never fires. Retry with
+        // short backoff so the window for the race closes.
+        constexpr int kMaxRetries = 5;
+        for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+            ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
+                                                      peer_json);
+            if (ret == 0) break;
+            if (attempt + 1 < kMaxRetries) {
+                // 100ms, 200ms, 400ms, 800ms — total <=1.5s
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(100 * (1 << attempt)));
+            }
+        }
         if (ret) {
             return nullptr;
         }
@@ -1200,9 +1224,30 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
     Json::Value peer;
-    int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
+
+    // Retry on transient handshake RPC failures. With 100ms..3200ms backoff
+    // capped at 1000ms, this yields ~6-7 seconds of retry budget per call --
+    // comfortably longer than a typical thundering-herd burst when N peers
+    // come online simultaneously. The worker pool's redispatch loop retries
+    // per slice up to max_retry_cnt times, so total retry window is
+    // (sendHandshake budget) x (max_retry_cnt), giving transient failures
+    // ample time to clear.
+    constexpr int kMaxRetries = 10;
+    int ret = 0;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        peer = Json::Value();
+        ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
+        if (ret == 0) break;
+        if (attempt + 1 < kMaxRetries) {
+            int backoff_ms = 100 * (1 << attempt);
+            if (backoff_ms > 1000) backoff_ms = 1000;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(backoff_ms));
+        }
+    }
     if (ret) return ret;
+
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
@@ -1221,8 +1266,21 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
     }
     auto local = TransferNotifyUtil::encode(local_desc);
     Json::Value peer;
-    int ret = handshake_plugin_->sendNotify(
-        peer_location.ip_or_host_name, peer_location.rpc_port, local, peer);
+    constexpr int kMaxRetries = 10;
+    int ret = 0;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        peer = Json::Value();
+        ret = handshake_plugin_->sendNotify(peer_location.ip_or_host_name,
+                                            peer_location.rpc_port, local,
+                                            peer);
+        if (ret == 0) break;
+        if (attempt + 1 < kMaxRetries) {
+            int backoff_ms = 100 * (1 << attempt);
+            if (backoff_ms > 1000) backoff_ms = 1000;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(backoff_ms));
+        }
+    }
     if (ret) return ret;
     TransferNotifyUtil::decode(peer, peer_desc);
     if (peer_desc.notify_msg.empty()) {

@@ -22,12 +22,13 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <random>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
-
-#include <mutex>
 #endif
 
 #ifdef USE_HTTP
@@ -633,6 +634,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             listener_.join();
         }
         closeListen();
+        // Drain in-flight workers so callbacks don't touch freed state
+        // (e.g., dangling references in on_*_callback_) after the plugin
+        // is destroyed.
+        std::unique_lock<std::mutex> lk(workers_mutex_);
+        workers_cv_.wait(lk, [this] { return workers_in_flight_ == 0; });
     }
 
     virtual void registerOnConnectionCallBack(OnReceiveCallBack callback) {
@@ -754,79 +760,95 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                auto peer_hostname =
-                    getNetworkAddress((struct sockaddr *)&addr);
-
-                Json::Value local, peer;
-
-                auto [type, json_str] = readString(conn_fd);
-                std::string errs;
-                if (!parseJsonString(json_str, peer, &errs)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to receive "
-                           "handshake message, "
-                           "malformed json format: "
-                        << errs << ", json string length: " << json_str.size()
-                        << ", json string content: " << json_str;
-                    close(conn_fd);
-                    continue;
+                // Fan out each accepted connection onto its own worker thread
+                // so slow callbacks or the client-close half-close wait cannot
+                // stall the single-threaded accept loop. Under a 32-peer mesh
+                // the original serialized pattern caused cascading handshake
+                // timeouts (truncated reads -> "malformed json" / "unexpected
+                // message type" -> endpoint reset).
+                {
+                    std::lock_guard<std::mutex> lk(workers_mutex_);
+                    workers_in_flight_++;
                 }
-
-                // old protocol equals Connection type
-                if (type == HandShakeRequestType::Connection ||
-                    type == HandShakeRequestType::OldProtocol) {
-                    if (on_connection_callback_)
-                        on_connection_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Metadata) {
-                    if (on_metadata_callback_)
-                        on_metadata_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Notify) {
-                    if (on_notify_callback_) on_notify_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Probe) {
-                    if (on_probe_callback_) on_probe_callback_(peer, local);
-                } else {
-                    LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
-                                  "message type";
-                    close(conn_fd);
-                    continue;
-                }
-
-                int ret =
-                    writeString(conn_fd, type, Json::FastWriter{}.write(local));
-                if (ret) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to send "
-                                  "message: "
-                                  "malformed json format, check tcp connection";
-                    close(conn_fd);
-                    continue;
-                }
-
-                ret = shutdown(conn_fd, SHUT_WR);
-                if (ret) {
-                    PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
-                                   "connection may be incomplete";
-                    close(conn_fd);
-                    continue;
-                }
-
-                // Wait for the client to close the connection
-                char byte;
-                ssize_t rc = read(conn_fd, &byte, sizeof(byte));
-                if (rc > 0) {
-                    LOG(ERROR) << "Unexpected socket read result: " << rc
-                               << ", byte: " << int(byte);
-                } else if (rc < 0) {
-                    PLOG(ERROR)
-                        << "Socket read failed while waiting client to close";
-                }
-                // else rc == 0, client close the connection, safe to close.
-
-                close(conn_fd);
+                std::thread([this, conn_fd]() {
+                    handleConnection(conn_fd);
+                    std::lock_guard<std::mutex> lk(workers_mutex_);
+                    workers_in_flight_--;
+                    if (workers_in_flight_ == 0) workers_cv_.notify_all();
+                }).detach();
             }
             return;
         });
 
         return 0;
+    }
+
+    void handleConnection(int conn_fd) {
+        Json::Value local, peer;
+
+        auto [type, json_str] = readString(conn_fd);
+        std::string errs;
+        if (!parseJsonString(json_str, peer, &errs)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
+                          "handshake message, "
+                          "malformed json format: "
+                       << errs << ", json string length: " << json_str.size()
+                       << ", json string content: " << json_str;
+            close(conn_fd);
+            return;
+        }
+
+        // old protocol equals Connection type
+        if (type == HandShakeRequestType::Connection ||
+            type == HandShakeRequestType::OldProtocol) {
+            if (on_connection_callback_) on_connection_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Metadata) {
+            if (on_metadata_callback_) on_metadata_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Notify) {
+            if (on_notify_callback_) on_notify_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Probe) {
+            if (on_probe_callback_) on_probe_callback_(peer, local);
+        } else {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
+            return;
+        }
+
+        int ret =
+            writeString(conn_fd, type, Json::FastWriter{}.write(local));
+        if (ret) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to send "
+                          "message: "
+                          "malformed json format, check tcp connection";
+            close(conn_fd);
+            return;
+        }
+
+        ret = shutdown(conn_fd, SHUT_WR);
+        if (ret) {
+            PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
+                           "connection may be incomplete";
+            close(conn_fd);
+            return;
+        }
+
+        // Wait for the client to close the connection so the kernel sends FIN
+        // rather than RST (a stray RST would abort the peer's read side before
+        // it consumed our response). Runs on a worker thread, so it no longer
+        // blocks the accept loop.
+        char byte;
+        ssize_t rc = read(conn_fd, &byte, sizeof(byte));
+        if (rc > 0) {
+            LOG(ERROR) << "Unexpected socket read result: " << rc
+                       << ", byte: " << int(byte);
+        } else if (rc < 0) {
+            PLOG(ERROR)
+                << "Socket read failed while waiting client to close";
+        }
+        // else rc == 0, client close the connection, safe to close.
+
+        close(conn_fd);
     }
 
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
@@ -1169,6 +1191,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
+
+    // Worker-thread tracking for the detached-per-connection handler.
+    std::mutex workers_mutex_;
+    std::condition_variable workers_cv_;
+    size_t workers_in_flight_ = 0;
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
