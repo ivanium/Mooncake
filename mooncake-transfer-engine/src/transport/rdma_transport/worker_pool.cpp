@@ -233,16 +233,49 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->active()) {
-            if (endpoint->inactiveTime() > 1.0)
+            if (endpoint->inactiveTime() > 1.0) {
+                LOG_EVERY_T(WARNING, 1)
+                    << "[MC_RDMA_ENDPOINT_DELETE] reason='inactive_gt_1s'"
+                    << " endpoint='" << entry.first << "'"
+                    << " local_nic='" << context_.nicPath() << "'"
+                    << " inactive_s=" << endpoint->inactiveTime()
+                    << " queued_slices=" << entry.second.size();
                 context_.deleteEndpoint(
                     entry.first);  // enable for re-establishation
+            }
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
         }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
-            LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first << ", mark it inactive";
+            auto *first_slice =
+                entry.second.empty() ? nullptr : entry.second.front();
+            LOG(ERROR)
+                << "[MC_RDMA_HANDSHAKE_ERROR] setupConnectionsByActive failed"
+                << " marking_endpoint_inactive=true endpoint='" << entry.first
+                << "' slice_count=" << entry.second.size()
+                << " local_nic='" << context_.nicPath() << "'"
+                << " context_active_before=" << context_.active()
+                << " failed_nr_polls_before=" << failed_nr_polls
+                << " success_nr_polls=" << success_nr_polls
+                << " first_slice_opcode="
+                << (first_slice ? static_cast<int>(first_slice->opcode) : -1)
+                << " first_slice_target_id="
+                << (first_slice ? first_slice->target_id : 0)
+                << " first_slice_length="
+                << (first_slice ? first_slice->length : 0)
+                << " first_slice_source_addr="
+                << (first_slice ? first_slice->source_addr : nullptr)
+                << " first_slice_dest_addr="
+                << (first_slice ? (void *)first_slice->rdma.dest_addr : nullptr)
+                << " first_slice_dest_rkey="
+                << (first_slice ? first_slice->rdma.dest_rkey : 0)
+                << " first_slice_retry_cnt="
+                << (first_slice ? first_slice->rdma.retry_cnt : 0)
+                << "/"
+                << (first_slice ? first_slice->rdma.max_retry_cnt : 0)
+                << " first_slice_peer_nic='"
+                << (first_slice ? first_slice->peer_nic_path : "") << "'";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             endpoint->set_active(false);
             failed_nr_polls++;
@@ -250,7 +283,9 @@ void WorkerPool::performPostSend(int thread_id) {
                 !success_nr_polls) {
                 LOG(WARNING)
                     << "Failed to establish peer endpoints in local RNIC "
-                    << context_.nicPath() << ", mark it inactive";
+                    << context_.nicPath() << ", mark it inactive"
+                    << " failed_nr_polls=" << failed_nr_polls
+                    << " success_nr_polls=" << success_nr_polls;
                 context_.set_active(false);
             }
             entry.second.clear();
@@ -268,6 +303,13 @@ void WorkerPool::performPostSend(int thread_id) {
 
 void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
+    int success_cq_count = 0;
+    int failed_cq_count = 0;
+    int flush_cq_count = 0;
+    Transport::Slice *failed_sample = nullptr;
+    int64_t failed_sample_latency_ms = -1;
+    const char *failed_sample_status = "<none>";
+    uint32_t failed_sample_vendor_err = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
     for (int cq_index = thread_id; cq_index < context_.cqCount();
@@ -282,17 +324,30 @@ void WorkerPool::performPollCq(int thread_id) {
         for (int i = 0; i < nr_poll; ++i) {
             Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
             assert(slice);
+            const int64_t completion_latency_ms =
+                slice->ts > 0
+                    ? (getCurrentTimeInNano() - slice->ts) / 1000000
+                    : -1;
             if (qp_depth_set.count(slice->rdma.qp_depth))
                 qp_depth_set[slice->rdma.qp_depth]++;
             else
                 qp_depth_set[slice->rdma.qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
+                failed_cq_count++;
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR) flush_cq_count++;
+                if (!failed_sample) {
+                    failed_sample = slice;
+                    failed_sample_latency_ms = completion_latency_ms;
+                    failed_sample_status = ibv_wc_status_str(wc[i].status);
+                    failed_sample_vendor_err = wc[i].vendor_err;
+                }
                 bool show_work_request_flushed_error = globalConfig().trace;
+                bool log_wc_error = wc[i].status != IBV_WC_WR_FLUSH_ERR ||
+                                    show_work_request_flushed_error;
                 // After detect an error, subsequent work requests will result
                 // in work_request_flushed_error, we hide this by default
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR ||
-                    show_work_request_flushed_error)
+                if (log_wc_error)
                     LOG(ERROR)
                         << "Worker: Process failed for slice (opcode: "
                         << slice->opcode
@@ -303,6 +358,10 @@ void WorkerPool::performPollCq(int thread_id) {
                         << ", peer_nic: " << slice->peer_nic_path
                         << ", dest_rkey: " << slice->rdma.dest_rkey
                         << ", retry_cnt: " << slice->rdma.retry_cnt
+                        << ", completion_latency_ms: "
+                        << completion_latency_ms
+                        << ", vendor_err: " << wc[i].vendor_err
+                        << ", delete_endpoint: true"
                         << "): " << ibv_wc_status_str(wc[i].status);
                 failed_nr_polls++;
                 if (context_.active() && failed_nr_polls > 32 &&
@@ -310,6 +369,18 @@ void WorkerPool::performPollCq(int thread_id) {
                     LOG(WARNING) << "Too many errors found in local RNIC "
                                  << context_.nicPath() << ", mark it inactive";
                     context_.set_active(false);
+                }
+                if (!log_wc_error) {
+                    LOG_EVERY_T(WARNING, 1)
+                        << "[MC_RDMA_ENDPOINT_DELETE] reason='wc_error'"
+                        << " local_nic='" << context_.nicPath() << "'"
+                        << " peer_nic='" << slice->peer_nic_path << "'"
+                        << " wc_status=" << ibv_wc_status_str(wc[i].status)
+                        << " vendor_err=" << wc[i].vendor_err
+                        << " retry_cnt=" << slice->rdma.retry_cnt << "/"
+                        << slice->rdma.max_retry_cnt
+                        << " completion_latency_ms=" << completion_latency_ms
+                        << " context_active_before=" << context_.active();
                 }
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
@@ -324,6 +395,7 @@ void WorkerPool::performPollCq(int thread_id) {
                     // redispatch(slice_list, thread_id);
                 }
             } else {
+                success_cq_count++;
                 slice->markSuccess();
                 processed_slice_count++;
                 success_nr_polls++;
@@ -339,6 +411,26 @@ void WorkerPool::performPollCq(int thread_id) {
 
     if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
+
+    if (failed_cq_count) {
+        LOG_EVERY_T(WARNING, 1)
+            << "[MC_RDMA_CQ_ERROR_SUMMARY] thread_id=" << thread_id
+            << " local_nic='" << context_.nicPath() << "'"
+            << " failed_cq=" << failed_cq_count
+            << " flush_cq=" << flush_cq_count
+            << " submitted_slices="
+            << submitted_slice_count_.load(std::memory_order_relaxed)
+            << " processed_slices="
+            << processed_slice_count_.load(std::memory_order_relaxed)
+            << " success_cq_in_poll=" << success_cq_count
+            << " success_nr_polls=" << success_nr_polls
+            << " failed_nr_polls=" << failed_nr_polls
+            << " failed_sample_peer='"
+            << (failed_sample ? failed_sample->peer_nic_path : "")
+            << "' failed_sample_status=" << failed_sample_status
+            << " failed_sample_vendor_err=" << failed_sample_vendor_err
+            << " failed_sample_latency_ms=" << failed_sample_latency_ms;
+    }
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,

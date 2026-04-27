@@ -100,7 +100,9 @@ class RdmaEndPoint {
     int destroyQP();
 
    private:
-    int disconnectUnlocked();
+    void logOutstandingWorkRequests(const std::string &reason,
+                                    Status curr_status) const;
+    int disconnectUnlocked(const std::string &reason = "disconnectUnlocked");
 
     // Resets the connection.
     //
