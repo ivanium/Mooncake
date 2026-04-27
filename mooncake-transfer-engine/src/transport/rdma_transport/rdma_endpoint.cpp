@@ -19,12 +19,48 @@
 #include <cassert>
 #include <cstddef>
 #include <chrono>
+#include <sstream>
+#include <string>
 #include <thread>
 
 #include "common.h"
 #include "config.h"
 
 namespace mooncake {
+namespace {
+
+const char *EndpointStatusToString(RdmaEndPoint::Status status) {
+    switch (status) {
+        case RdmaEndPoint::INITIALIZING:
+            return "INITIALIZING";
+        case RdmaEndPoint::UNCONNECTED:
+            return "UNCONNECTED";
+        case RdmaEndPoint::CONNECTING:
+            return "CONNECTING";
+        case RdmaEndPoint::CONNECTED:
+            return "CONNECTED";
+    }
+    return "UNKNOWN";
+}
+
+const char *SliceStatusToString(Transport::Slice::SliceStatus status) {
+    switch (status) {
+        case Transport::Slice::PENDING:
+            return "PENDING";
+        case Transport::Slice::POSTED:
+            return "POSTED";
+        case Transport::Slice::SUCCESS:
+            return "SUCCESS";
+        case Transport::Slice::TIMEOUT:
+            return "TIMEOUT";
+        case Transport::Slice::FAILED:
+            return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+}  // namespace
+
 const static uint8_t MAX_HOP_LIMIT = 16;
 const static uint8_t TIMEOUT = 14;
 const static uint8_t RETRY_CNT = 7;
@@ -385,9 +421,34 @@ void RdmaEndPoint::disconnect() {
     disconnectUnlocked();
 }
 
-int RdmaEndPoint::disconnectUnlocked() {
+void RdmaEndPoint::logOutstandingWorkRequests(
+    const std::string &reason, Status curr_status) const {
+    int outstanding_total = 0;
+    std::ostringstream qp_depths_before;
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (i) qp_depths_before << ",";
+        qp_depths_before << i << ":" << wr_depth_list_[i];
+        outstanding_total += wr_depth_list_[i];
+    }
+    if (outstanding_total > 0) {
+        LOG(WARNING) << "[MC_RDMA_ENDPOINT_RESET] reason='" << reason << "'"
+                     << " local_nic='" << context_.nicPath() << "'"
+                     << " peer_nic='" << peer_nic_path_ << "'"
+                     << " status=" << EndpointStatusToString(curr_status)
+                     << " active=" << active_
+                     << " outstanding_total=" << outstanding_total
+                     << " cq_outstanding_before="
+                     << (cq_outstanding_ ? *cq_outstanding_ : -1)
+                     << " qp_depths_before={" << qp_depths_before.str()
+                     << "}";
+    }
+}
+
+int RdmaEndPoint::disconnectUnlocked(const std::string &reason) {
     auto curr_status = status_.load(std::memory_order_acquire);
     if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
+
+    logOutstandingWorkRequests(reason, curr_status);
 
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -421,9 +482,10 @@ int RdmaEndPoint::resetConnection(const std::string &reason) {
     if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
 
 #ifdef CONFIG_ERDMA
+    logOutstandingWorkRequests(reason, curr_status);
     int ret = reconstruct();
 #else
-    int ret = disconnectUnlocked();
+    int ret = disconnectUnlocked(reason);
 #endif
 
     if (ret) {
@@ -456,7 +518,17 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_) return 0;
+    if (!active_) {
+        LOG_EVERY_T(WARNING, 1)
+            << "[MC_RDMA_POST_SEND_ERROR] inactive endpoint"
+            << " local_nic='" << context_.nicPath() << "'"
+            << " peer_nic='" << peer_nic_path_ << "'"
+            << " requested=" << slice_list.size()
+            << " status="
+            << EndpointStatusToString(status_.load(std::memory_order_relaxed))
+            << " inactive_s=" << inactiveTime();
+        return 0;
+    }
 
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
@@ -511,8 +583,33 @@ int RdmaEndPoint::submitPostSend(
         __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
         __sync_fetch_and_add(cq_outstanding_, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+        auto *first_slice = wr_count > 0 ? slice_list[start] : nullptr;
         if (rc) {
-            PLOG(ERROR) << "Failed to ibv_post_send";
+            PLOG(ERROR) << "[MC_RDMA_POST_SEND_ERROR] ibv_post_send failed"
+                        << " local_nic='" << context_.nicPath() << "'"
+                        << " peer_nic='" << peer_nic_path_ << "'"
+                        << " qp_index=" << qp_index
+                        << " requested=" << requested << " start=" << start
+                        << " wr_count=" << wr_count << " rc=" << rc
+                        << " qp_depth_after=" << wr_depth_list_[qp_index]
+                        << " cq_after="
+                        << (cq_outstanding_ ? *cq_outstanding_ : -1)
+                        << " status="
+                        << EndpointStatusToString(
+                               status_.load(std::memory_order_relaxed))
+                        << " first_slice_status="
+                        << (first_slice ? SliceStatusToString(first_slice->status)
+                                        : "<none>")
+                        << " first_slice_len="
+                        << (first_slice ? first_slice->length : 0)
+                        << " first_slice_retry="
+                        << (first_slice ? first_slice->rdma.retry_cnt : 0)
+                        << "/"
+                        << (first_slice ? first_slice->rdma.max_retry_cnt : 0)
+                        << " first_slice_dest=0x" << std::hex
+                        << (first_slice ? first_slice->rdma.dest_addr : 0)
+                        << std::dec << " first_slice_rkey="
+                        << (first_slice ? first_slice->rdma.dest_rkey : 0);
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);

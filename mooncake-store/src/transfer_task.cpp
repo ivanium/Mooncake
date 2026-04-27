@@ -3,13 +3,227 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <sstream>
+#include <string>
 #include <vector>
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+namespace {
+
+const char* SliceStatusToString(Transport::Slice::SliceStatus status) {
+    switch (status) {
+        case Transport::Slice::PENDING:
+            return "PENDING";
+        case Transport::Slice::POSTED:
+            return "POSTED";
+        case Transport::Slice::SUCCESS:
+            return "SUCCESS";
+        case Transport::Slice::TIMEOUT:
+            return "TIMEOUT";
+        case Transport::Slice::FAILED:
+            return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+const char* TransferOpToString(TransferRequest::OpCode opcode) {
+    switch (opcode) {
+        case TransferRequest::READ:
+            return "READ";
+        case TransferRequest::WRITE:
+            return "WRITE";
+    }
+    return "UNKNOWN";
+}
+
+void LogBatchSubmitError(BatchID batch_id,
+                         const std::vector<TransferRequest>& requests,
+                         const Status& status) {
+    size_t total_bytes = 0;
+    size_t reads = 0;
+    size_t writes = 0;
+    for (const auto& request : requests) {
+        total_bytes += request.length;
+        if (request.opcode == TransferRequest::READ) {
+            reads++;
+        } else if (request.opcode == TransferRequest::WRITE) {
+            writes++;
+        }
+    }
+    LOG(ERROR) << "[MC_RDMA_BATCH_SUBMIT_ERROR] batch_id=" << batch_id
+               << " error_code=" << status.code()
+               << " request_count=" << requests.size()
+               << " total_bytes=" << total_bytes << " reads=" << reads
+               << " writes=" << writes;
+
+    constexpr size_t kMaxRequestSamples = 5;
+    for (size_t i = 0; i < requests.size() && i < kMaxRequestSamples; ++i) {
+        const auto& request = requests[i];
+        LOG(ERROR) << "[MC_RDMA_BATCH_SUBMIT_ERROR]   request_sample idx=" << i
+                   << " op=" << TransferOpToString(request.opcode)
+                   << " source=" << static_cast<const void*>(request.source)
+                   << " target_id=" << request.target_id
+                   << " target_offset=0x" << std::hex << request.target_offset
+                   << std::dec << " length=" << request.length
+                   << " advise_retry_cnt=" << request.advise_retry_cnt;
+    }
+}
+
+void DumpBatchTimeoutState(BatchID batch_id, Transport::BatchDesc& batch_desc,
+                           int64_t timeout_milliseconds) {
+    constexpr size_t kMaxTaskSamples = 8;
+    constexpr size_t kMaxSliceSamplesPerTask = 5;
+    constexpr int64_t kInvalidAgeMs = -1;
+    const int64_t now_ns = getCurrentTimeInNano();
+    size_t total_slices = 0;
+    size_t total_pending = 0;
+    size_t total_posted = 0;
+    size_t total_success = 0;
+    size_t total_timeout = 0;
+    size_t total_failed = 0;
+    size_t unfinished_tasks = 0;
+
+    for (const auto& task : batch_desc.task_list) {
+        total_slices += task.slice_list.size();
+        if (!task.is_finished) {
+            unfinished_tasks++;
+        }
+        for (auto* slice : task.slice_list) {
+            if (!slice) continue;
+            switch (slice->status) {
+                case Transport::Slice::PENDING:
+                    total_pending++;
+                    break;
+                case Transport::Slice::POSTED:
+                    total_posted++;
+                    break;
+                case Transport::Slice::SUCCESS:
+                    total_success++;
+                    break;
+                case Transport::Slice::TIMEOUT:
+                    total_timeout++;
+                    break;
+                case Transport::Slice::FAILED:
+                    total_failed++;
+                    break;
+            }
+        }
+    }
+
+    LOG(ERROR) << "[MC_RDMA_TIMEOUT_DUMP] batch_id=" << batch_id
+               << " timeout_ms=" << timeout_milliseconds
+               << " batch_size=" << batch_desc.batch_size
+               << " task_count=" << batch_desc.task_list.size()
+               << " unfinished_tasks=" << unfinished_tasks
+               << " batch_is_finished="
+               << batch_desc.is_finished.load(std::memory_order_relaxed)
+               << " batch_has_failure="
+               << batch_desc.has_failure.load(std::memory_order_relaxed)
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+               << " finished_task_count="
+               << batch_desc.finished_task_count.load(
+                      std::memory_order_relaxed)
+#endif
+               << " total_slices=" << total_slices
+               << " slice_status_counts={PENDING:" << total_pending
+               << ", POSTED:" << total_posted
+               << ", SUCCESS:" << total_success
+               << ", TIMEOUT:" << total_timeout
+               << ", FAILED:" << total_failed << "}";
+
+    size_t dumped_tasks = 0;
+    auto dump_task = [&](size_t task_id,
+                         const Transport::TransferTask& task) {
+        std::array<size_t, 5> status_counts{};
+        for (auto* slice : task.slice_list) {
+            if (!slice) continue;
+            status_counts[static_cast<size_t>(slice->status)]++;
+        }
+        const auto* first_slice =
+            task.slice_list.empty() ? nullptr : task.slice_list.front();
+
+        LOG(ERROR) << "[MC_RDMA_TIMEOUT_DUMP] task_id=" << task_id
+                   << " is_finished=" << task.is_finished
+                   << " slice_count=" << task.slice_count
+                   << " completed_slices="
+                   << (task.success_slice_count + task.failed_slice_count)
+                   << " success_slices=" << task.success_slice_count
+                   << " failed_slices=" << task.failed_slice_count
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+                   << " event_completed_slices="
+                   << task.completed_slice_count
+#endif
+                   << " transferred_bytes=" << task.transferred_bytes
+                   << " total_bytes=" << task.total_bytes
+                   << " sample_op="
+                   << (first_slice ? TransferOpToString(first_slice->opcode)
+                                   : "<none>")
+                   << " sample_target_id="
+                   << (first_slice ? first_slice->target_id : 0)
+                   << " sample_len=" << (first_slice ? first_slice->length : 0)
+                   << " status_counts={PENDING:"
+                   << status_counts[Transport::Slice::PENDING]
+                   << ", POSTED:" << status_counts[Transport::Slice::POSTED]
+                   << ", SUCCESS:" << status_counts[Transport::Slice::SUCCESS]
+                   << ", TIMEOUT:" << status_counts[Transport::Slice::TIMEOUT]
+                   << ", FAILED:" << status_counts[Transport::Slice::FAILED]
+                   << "}";
+
+        size_t dumped_slices = 0;
+        for (auto* slice : task.slice_list) {
+            if (!slice || slice->status == Transport::Slice::SUCCESS ||
+                slice->status == Transport::Slice::FAILED) {
+                continue;
+            }
+            const int64_t age_ms =
+                slice->ts > 0 ? (now_ns - slice->ts) / 1000000
+                              : kInvalidAgeMs;
+            LOG(ERROR) << "[MC_RDMA_TIMEOUT_DUMP]   slice_sample task_id="
+                       << task_id << " status="
+                       << SliceStatusToString(slice->status)
+                       << " peer_nic='" << slice->peer_nic_path << "'"
+                       << " opcode=" << TransferOpToString(slice->opcode)
+                       << " target_id=" << slice->target_id
+                       << " length=" << slice->length
+                       << " source_addr=" << slice->source_addr
+                       << " age_since_post_ms=" << age_ms;
+            if (++dumped_slices >= kMaxSliceSamplesPerTask) break;
+        }
+
+        dumped_tasks++;
+    };
+
+    for (size_t task_id = 0; task_id < batch_desc.task_list.size();
+         ++task_id) {
+        const auto& task = batch_desc.task_list[task_id];
+        if (task.is_finished) continue;
+        dump_task(task_id, task);
+        if (dumped_tasks >= kMaxTaskSamples) break;
+    }
+    if (unfinished_tasks > dumped_tasks) {
+        LOG(ERROR) << "[MC_RDMA_TIMEOUT_DUMP] unfinished task dump truncated "
+                   << "after " << dumped_tasks << " tasks";
+        return;
+    }
+
+    if (dumped_tasks == 0) {
+        for (size_t task_id = 0; task_id < batch_desc.task_list.size();
+             ++task_id) {
+            dump_task(task_id, batch_desc.task_list[task_id]);
+            if (dumped_tasks >= kMaxTaskSamples) {
+                LOG(ERROR) << "[MC_RDMA_TIMEOUT_DUMP] finished task dump "
+                           << "truncated after " << dumped_tasks << " tasks";
+                break;
+            }
+        }
+    }
+}
+
+}  // namespace
 
 // ============================================================================
 // FilereadWorkerPool Implementation
@@ -363,6 +577,7 @@ void TransferEngineOperationState::wait_for_completion() {
         LOG(ERROR) << "Failed to complete transfers after "
                    << timeout_milliseconds << " milliseconds for batch "
                    << batch_id_;
+        DumpBatchTimeoutState(batch_id_, batch_desc, timeout_milliseconds);
     }
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
@@ -372,6 +587,8 @@ void TransferEngineOperationState::wait_for_completion() {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
                        << batch_id_;
+            auto& batch_desc = Transport::toBatchDesc(batch_id_);
+            DumpBatchTimeoutState(batch_id_, batch_desc, timeout_milliseconds);
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -632,6 +849,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
+        LogBatchSubmitError(batch_id, requests, s);
         // Note: batch_id will be freed by TransferEngineOperationState
         // destructor if we create the state object, otherwise we need to free
         // it here
