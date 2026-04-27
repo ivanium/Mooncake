@@ -231,14 +231,22 @@ case "$ARCH" in
         ;;
 esac
 
-# Set platform tag if not already set
-PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_${GLIBC_VERSION}_${ARCH_SUFFIX}"}
-
+# Platform tag: only pass --plat to auditwheel when the user explicitly sets
+# PLATFORM_TAG. Otherwise let auditwheel auto-pick the highest-compatible
+# manylinux level for the bundled libraries. Forcing a glibc-derived tag
+# fails when bundled deps (e.g. libgflags/libjsoncpp built with newer GCC)
+# reference GLIBCXX symbols above what that tag allows.
 echo "Detected architecture: $ARCH_SUFFIX"
 echo "Detected glibc version: $GLIBC_VERSION"
-echo "Using platform tag: $PLATFORM_TAG"
+PLAT_ARGS=()
+if [ -n "${PLATFORM_TAG:-}" ]; then
+    echo "Using platform tag (override): $PLATFORM_TAG"
+    PLAT_ARGS=(--plat "$PLATFORM_TAG")
+else
+    echo "Platform tag: auto-detect via auditwheel"
+fi
 
-echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+echo "Building and repairing wheel with auditwheel"
 python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
@@ -325,7 +333,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libllm_datadist*.so \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
-    -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+    -w ${REPAIRED_DIR}/ "${PLAT_ARGS[@]}"
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
 # can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
