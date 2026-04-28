@@ -15,6 +15,7 @@
 #include <cctype>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "real_client.h"
@@ -3437,9 +3438,23 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
     valid_operations.reserve(num_keys);
+    std::unordered_set<std::string> seen_keys;
+    seen_keys.reserve(num_keys);
 
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
+
+        // Reject duplicate keys: the API contract is one entry per unique
+        // key, and downstream collations (valid_local_disk_operations,
+        // batch_slices map) collapse duplicates while results[i] would
+        // still get a success entry — leaving later occurrences with
+        // un-written destination buffers. Fail closed instead.
+        if (!seen_keys.insert(key).second) {
+            LOG(ERROR) << "Duplicate key in batch_get_into request: '" << key
+                       << "' at index " << i;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
 
         // Handle query failures
         if (!query_results[i]) {
@@ -3461,8 +3476,55 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             continue;
         }
 
-        // Calculate required buffer size
-        const auto &replica = query_result_values.replicas[0];
+        // Select usable replica: prefer first memory replica (faster);
+        // fall back to first local-disk replica. Avoids the previous
+        // fragile `replicas[0] && size==1` check that misclassified
+        // [LOCAL_DISK, MEMORY] (and rejected mixed [MEMORY, LOCAL_DISK]
+        // when memory wasn't first).
+        constexpr size_t kNoSelection = std::numeric_limits<size_t>::max();
+        size_t selected_idx = kNoSelection;
+        bool use_local_disk_path = false;
+        for (size_t k = 0; k < query_result_values.replicas.size(); ++k) {
+            if (query_result_values.replicas[k].is_memory_replica()) {
+                selected_idx = k;
+                use_local_disk_path = false;
+                break;
+            }
+        }
+        if (selected_idx == kNoSelection) {
+            for (size_t k = 0; k < query_result_values.replicas.size(); ++k) {
+                if (query_result_values.replicas[k].is_local_disk_replica()) {
+                    selected_idx = k;
+                    use_local_disk_path = true;
+                    break;
+                }
+            }
+        }
+        if (selected_idx == kNoSelection) {
+            LOG(ERROR) << "No usable replica for key '" << key
+                       << "' (replicas=" << query_result_values.replicas.size()
+                       << ")";
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        // Narrow the replica list to ONLY the selected descriptor.
+        // Downstream code (Client::BatchGet → FindFirstCompleteReplica,
+        // and any later `replicas.at(0)` / `replicas[0]` indexing for
+        // sizing or transport_endpoint) would otherwise pick a different
+        // replica than the one we chose — e.g. with [LOCAL_DISK, MEMORY]
+        // we'd select MEMORY here but BatchGet would pick LOCAL_DISK and
+        // crash on `get_disk_descriptor()`.
+        //
+        // QueryResult::replicas is declared `const std::vector<...>`, so
+        // we build a fresh QueryResult containing only the selected
+        // replica rather than mutating in place.
+        std::vector<Replica::Descriptor> selected_replicas;
+        selected_replicas.reserve(1);
+        selected_replicas.push_back(
+            query_result_values.replicas[selected_idx]);
+        QueryResult narrowed_query_result(std::move(selected_replicas),
+                                          query_result_values.lease_timeout);
+        const auto &replica = narrowed_query_result.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
@@ -3478,13 +3540,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
 
-        if (query_result_values.replicas.size() == 1 &&
-            query_result_values.replicas.at(0).is_local_disk_replica()) {
+        if (use_local_disk_path) {
             valid_local_disk_operations.emplace(
                 key,
                 ValidKeyInfo{.key = key,
                              .original_index = i,
-                             .query_result = std::move(query_result_values),
+                             .query_result = std::move(narrowed_query_result),
                              .slices = std::move(key_slices),
                              .total_size = total_size});
             results[i] = static_cast<int64_t>(total_size);
@@ -3494,7 +3555,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         valid_operations.push_back(
             {.key = key,
              .original_index = i,
-             .query_result = std::move(query_result_values),
+             .query_result = std::move(narrowed_query_result),
              .slices = std::move(key_slices),
              .total_size = total_size});
 
@@ -3538,16 +3599,18 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         }
     }
 
-    // Prepare batch transfer data structures
-    std::unordered_map<std::string, std::unordered_map<std::string, Slice>>
+    // Prepare batch transfer data structures. Multi-slice destinations are
+    // forwarded as-is; the transfer engine packs them sequentially against
+    // the owner-side blob via offset arithmetic in submit_batch_get_offload_object.
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, std::vector<Slice>>>
         offload_objects;
 
     for (const auto &op_it : valid_local_disk_operations) {
         const auto &replica = op_it.second.query_result.replicas.at(0);
         auto [store_segment_it, _] = offload_objects.try_emplace(
             replica.get_local_disk_descriptor().transport_endpoint);
-        store_segment_it->second.emplace(op_it.first,
-                                         op_it.second.slices.at(0));
+        store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
     size_t offload_object_count = 0;
@@ -3795,9 +3858,21 @@ RealClient::batch_get_into_multi_buffers_internal(
     };
 
     std::vector<ValidKeyInfo> valid_operations;
+    std::unordered_map<std::string, ValidKeyInfo> valid_local_disk_operations;
     valid_operations.reserve(num_keys);
+    std::unordered_set<std::string> seen_keys;
+    seen_keys.reserve(num_keys);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
+        // Reject duplicate keys: see comment in batch_get_into_internal.
+        // Without this, valid_local_disk_operations.emplace silently drops
+        // the second occurrence while results still gets a success entry.
+        if (!seen_keys.insert(key).second) {
+            LOG(ERROR) << "Duplicate key in batch_get_into_multi_buffers: '"
+                       << key << "' at index " << i;
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
@@ -3815,8 +3890,56 @@ RealClient::batch_get_into_multi_buffers_internal(
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
-        // Calculate required buffer size
-        const auto &replica = query_result_values.replicas[0];
+        // Select usable replica: prefer first memory replica, fall back to
+        // first local-disk replica. Avoids the previous fragile
+        // `replicas[0] && size==1` check that misclassified
+        // [LOCAL_DISK, MEMORY] (and rejected mixed [MEMORY, LOCAL_DISK]
+        // when memory wasn't first).
+        constexpr size_t kNoSelection = std::numeric_limits<size_t>::max();
+        size_t selected_idx = kNoSelection;
+        bool use_local_disk_path = false;
+        for (size_t k = 0; k < query_result_values.replicas.size(); ++k) {
+            if (query_result_values.replicas[k].is_memory_replica()) {
+                selected_idx = k;
+                use_local_disk_path = false;
+                break;
+            }
+        }
+        if (selected_idx == kNoSelection) {
+            for (size_t k = 0; k < query_result_values.replicas.size(); ++k) {
+                if (query_result_values.replicas[k].is_local_disk_replica()) {
+                    selected_idx = k;
+                    use_local_disk_path = true;
+                    break;
+                }
+            }
+        }
+        if (selected_idx == kNoSelection) {
+            LOG(ERROR) << "No usable replica for key '" << key
+                       << "' (replicas=" << query_result_values.replicas.size()
+                       << ")";
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        // Narrow the replica list to ONLY the selected descriptor.
+        // Downstream code (Client::BatchGet → FindFirstCompleteReplica,
+        // and the LOCAL_DISK consumer's `query_result.replicas.at(0)`
+        // for transport_endpoint at line ~3970) would otherwise pick a
+        // different replica than the one we chose — e.g. with
+        // [DISK, LOCAL_DISK] we'd select LOCAL_DISK here but the
+        // grouping consumer would call `get_local_disk_descriptor()`
+        // on a DiskDescriptor and throw.
+        //
+        // QueryResult::replicas is declared `const std::vector<...>`, so
+        // we build a fresh QueryResult containing only the selected
+        // replica rather than mutating in place.
+        std::vector<Replica::Descriptor> selected_replicas;
+        selected_replicas.reserve(1);
+        selected_replicas.push_back(
+            query_result_values.replicas[selected_idx]);
+        QueryResult narrowed_query_result(std::move(selected_replicas),
+                                          query_result_values.lease_timeout);
+        const auto &replica = narrowed_query_result.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
@@ -3834,55 +3957,132 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica()) {
+        if (!use_local_disk_path) {
+            // Memory-replica path: forward worker buffers verbatim.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
+            valid_operations.push_back(
+                {.key = key,
+                 .original_index = i,
+                 .query_result = std::move(narrowed_query_result),
+                 .slices = std::move(key_slices),
+                 .total_size = total_size});
         } else {
-            LOG(ERROR) << "Invalid replica type for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
+            // LOCAL_DISK read-back: route through the offload-object path
+            // (worker → owner RPC → owner reads its local disk → RDMA back
+            // into the destination buffers). The on-disk object is one
+            // contiguous blob of size `total_size`. We forward the
+            // worker-side multi-buffer destination as a vector<Slice>; the
+            // transfer engine (`submit_batch_get_offload_object`) walks
+            // `pointer + offset` per slice so non-contiguous destinations
+            // (vLLM's per-layer KV cache slabs) are scattered correctly.
+            if (buffers.size() != sizes.size()) {
+                LOG(ERROR) << "Buffer/size count mismatch for key '" << key
+                           << "': buffers=" << buffers.size()
+                           << ", sizes=" << sizes.size();
+                results.emplace_back(
+                    tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            if (buffers.empty()) {
+                LOG(ERROR) << "Empty buffer list for LOCAL_DISK key '" << key
+                           << "'";
+                results.emplace_back(
+                    tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            uint64_t cumulative = 0;
+            for (size_t j = 0; j < buffers.size(); ++j) {
+                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+                cumulative += sizes[j];
+            }
+            if (cumulative != total_size) {
+                LOG(ERROR)
+                    << "Combined buffer size " << cumulative
+                    << " does not match expected object size " << total_size
+                    << " for LOCAL_DISK key '" << key << "'";
+                results.emplace_back(
+                    tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            valid_local_disk_operations.emplace(
+                key,
+                ValidKeyInfo{.key = key,
+                             .original_index = i,
+                             .query_result = std::move(narrowed_query_result),
+                             .slices = std::move(key_slices),
+                             .total_size = total_size});
         }
-
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = std::move(query_result_values),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
-        // Set success result (actual bytes transferred)
+        // Set success result (actual bytes transferred). Failure paths
+        // continue earlier without touching results past this point.
         results.emplace_back(static_cast<int64_t>(total_size));
     }
     // Early return if no valid operations
-    if (valid_operations.empty()) {
+    if (valid_operations.empty() && valid_local_disk_operations.empty()) {
         return results;
     }
 
-    // Prepare batch transfer data structures
-    std::vector<std::string> batch_keys;
-    std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    batch_keys.reserve(valid_operations.size());
-    batch_query_results.reserve(valid_operations.size());
-    for (auto &op : valid_operations) {
-        batch_keys.push_back(op.key);
-        batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+    // Memory-replica batch fetch
+    if (!valid_operations.empty()) {
+        std::vector<std::string> batch_keys;
+        std::vector<QueryResult> batch_query_results;
+        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        batch_keys.reserve(valid_operations.size());
+        batch_query_results.reserve(valid_operations.size());
+        for (auto &op : valid_operations) {
+            batch_keys.push_back(op.key);
+            batch_query_results.push_back(op.query_result);
+            batch_slices[op.key] = op.slices;
+        }
+
+        auto batch_get_results =
+            client_->BatchGet(batch_keys, batch_query_results, batch_slices,
+                              prefer_alloc_in_same_node);
+
+        // Process transfer results
+        for (size_t j = 0; j < batch_get_results.size(); ++j) {
+            const auto &op = valid_operations[j];
+            if (!batch_get_results[j]) {
+                const auto error = batch_get_results[j].error();
+                LOG(ERROR) << "BatchGet failed for key '" << op.key
+                           << "': " << toString(error);
+                results[op.original_index] = tl::unexpected(error);
+            }
+        }
     }
 
-    auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                          prefer_alloc_in_same_node);
-
-    // Process transfer results
-    for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto &op = valid_operations[j];
-
-        if (!batch_get_results[j]) {
-            const auto error = batch_get_results[j].error();
-            LOG(ERROR) << "BatchGet failed for key '" << op.key
-                       << "': " << toString(error);
-            results[op.original_index] = tl::unexpected(error);
+    // LOCAL_DISK read-back: group by owner transport_endpoint, dispatch one
+    // offload-object fetch per owner. Mirrors the existing path in the
+    // single-buffer batch_get_into_internal.
+    if (!valid_local_disk_operations.empty()) {
+        std::unordered_map<
+            std::string,
+            std::unordered_map<std::string, std::vector<Slice>>>
+            offload_objects;
+        for (const auto &op_it : valid_local_disk_operations) {
+            const auto &replica =
+                op_it.second.query_result.replicas.at(0);
+            auto [store_segment_it, _] = offload_objects.try_emplace(
+                replica.get_local_disk_descriptor().transport_endpoint);
+            store_segment_it->second.emplace(op_it.first,
+                                             op_it.second.slices);
+        }
+        for (auto &offload_objects_it : offload_objects) {
+            auto batch_get_offload_result =
+                batch_get_into_offload_object_internal(
+                    offload_objects_it.first, offload_objects_it.second);
+            if (!batch_get_offload_result) {
+                LOG(ERROR) << "Batch get offload object failed with error: "
+                           << batch_get_offload_result.error();
+                for (const auto &offload_object_it :
+                     offload_objects_it.second) {
+                    results[valid_local_disk_operations
+                                .at(offload_object_it.first)
+                                .original_index] = tl::make_unexpected(
+                        batch_get_offload_result.error());
+                }
+            }
         }
     }
     return results;
@@ -4235,13 +4435,21 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
-    std::unordered_map<std::string, Slice> &objects) {
+    std::unordered_map<std::string, std::vector<Slice>> &objects) {
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
+    keys.reserve(objects.size());
+    sizes.reserve(objects.size());
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
-        sizes.emplace_back(object_it.second.size);
+        // Owner-side allocation must match the contiguous on-disk size,
+        // so sum the per-key destination slices.
+        int64_t total = 0;
+        for (const auto &slice : object_it.second) {
+            total += static_cast<int64_t>(slice.size);
+        }
+        sizes.emplace_back(total);
     }
     auto batchGetResp = client_requester_->batch_get_offload_object(
         target_rpc_service_addr, keys, sizes);
@@ -4249,6 +4457,19 @@ RealClient::batch_get_into_offload_object_internal(
         LOG(ERROR) << "Batch get offload object failed with error: "
                    << batchGetResp.error();
         return tl::make_unexpected(batchGetResp.error());
+    }
+    // RPC-boundary validation: the owner should return one pointer per key.
+    // If the vectors are mis-aligned, indexing pointers[i] later in
+    // submit_batch_get_offload_object would silently mis-route or out-of-
+    // bounds read, so reject before we get there.
+    if (batchGetResp->pointers.size() != keys.size()) {
+        LOG(ERROR) << "Batch get offload object response size mismatch: "
+                   << "keys=" << keys.size()
+                   << ", pointers=" << batchGetResp->pointers.size()
+                   << ", target=" << target_rpc_service_addr;
+        client_requester_->release_offload_buffer(target_rpc_service_addr,
+                                                  batchGetResp->batch_id);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
     auto result =
         client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
