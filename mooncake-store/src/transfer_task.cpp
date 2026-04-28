@@ -551,25 +551,60 @@ std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>&
+        batched_slices) {
+    // Per-key, the on-disk object is one contiguous blob anchored at
+    // owner-side `pointer`. We emit one TransferRequest per destination
+    // slice, with target_offset advancing by the cumulative slice size.
+    // Single-slice callers see the same behaviour as before.
+    //
+    // Fail closed: if a key is missing from `batched_slices` or has a
+    // null/zero destination slice, we return std::nullopt so the caller
+    // marks the entire batch as failed rather than silently reporting
+    // success on keys whose destination buffers were never written.
+    if (keys.size() != pointers.size()) {
+        LOG(ERROR) << "submit_batch_get_offload_object size mismatch: keys="
+                   << keys.size() << ", pointers=" << pointers.size();
+        return std::nullopt;
+    }
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        auto pointer = pointers[i];
+        const auto& key = keys[i];
+        const auto pointer = pointers[i];
         SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
             return std::nullopt;
         }
-        const auto& slice = batched_slices.find(key)->second;
-        TransferRequest request;
-        request.opcode = TransferRequest::READ;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = pointer;
-        request.length = slice.size;
-        requests.emplace_back(request);
+        auto it = batched_slices.find(key);
+        if (it == batched_slices.end()) {
+            LOG(ERROR) << "submit_batch_get_offload_object: key '" << key
+                       << "' missing from batched_slices";
+            return std::nullopt;
+        }
+        if (it->second.empty()) {
+            LOG(ERROR) << "submit_batch_get_offload_object: key '" << key
+                       << "' has empty destination slice list";
+            return std::nullopt;
+        }
+        uint64_t offset = 0;
+        for (size_t j = 0; j < it->second.size(); ++j) {
+            const auto& slice = it->second[j];
+            if (slice.ptr == nullptr || slice.size == 0) {
+                LOG(ERROR) << "submit_batch_get_offload_object: key '" << key
+                           << "' slice[" << j << "] is null or zero-size";
+                return std::nullopt;
+            }
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = static_cast<char*>(slice.ptr);
+            request.target_id = seg;
+            request.target_offset = pointer + offset;
+            request.length = slice.size;
+            requests.emplace_back(request);
+            offset += slice.size;
+        }
     }
     return submitTransfer(requests);
 }
