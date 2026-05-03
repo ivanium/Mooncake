@@ -86,6 +86,8 @@ class OperationState {
      */
     virtual TransferStrategy get_strategy() const = 0;
 
+    virtual std::optional<BatchID> debug_batch_id() const { return std::nullopt; }
+
     /**
      * @brief Wait for the operation to complete (strategy-specific
      * implementation)
@@ -189,6 +191,8 @@ class TransferEngineOperationState : public OperationState {
         return TransferStrategy::TRANSFER_ENGINE;
     }
 
+    std::optional<BatchID> debug_batch_id() const override { return batch_id_; }
+
    private:
     /**
      * @brief Check the current completion status of the task, make sure to lock
@@ -245,6 +249,8 @@ class TransferFuture {
      * @return TransferStrategy enum value
      */
     TransferStrategy strategy() const;
+
+    std::optional<BatchID> debug_batch_id() const;
 
    private:
     std::shared_ptr<OperationState> state_;

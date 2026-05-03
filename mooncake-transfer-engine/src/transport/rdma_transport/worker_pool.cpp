@@ -17,6 +17,9 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <sstream>
+#include <string>
+#include <unordered_map>
 
 #include "config.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -28,6 +31,97 @@
 // #define CONFIG_CACHE_ENDPOINT
 
 namespace mooncake {
+namespace {
+
+const char *TransferOpToString(Transport::TransferRequest::OpCode opcode) {
+    switch (opcode) {
+        case Transport::TransferRequest::READ:
+            return "READ";
+        case Transport::TransferRequest::WRITE:
+            return "WRITE";
+    }
+    return "UNKNOWN";
+}
+
+const char *SliceStatusToString(Transport::Slice::SliceStatus status) {
+    switch (status) {
+        case Transport::Slice::PENDING:
+            return "PENDING";
+        case Transport::Slice::POSTED:
+            return "POSTED";
+        case Transport::Slice::SUCCESS:
+            return "SUCCESS";
+        case Transport::Slice::TIMEOUT:
+            return "TIMEOUT";
+        case Transport::Slice::FAILED:
+            return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+std::string TaskIdForSlice(const Transport::Slice *slice) {
+    if (!slice || !slice->task || slice->task->batch_id == 0) return "<none>";
+    auto &batch_desc = Transport::toBatchDesc(slice->task->batch_id);
+    for (size_t i = 0; i < batch_desc.task_list.size(); ++i) {
+        if (&batch_desc.task_list[i] == slice->task) return std::to_string(i);
+    }
+    return "<unknown>";
+}
+
+std::string SliceTaskLogFields(const Transport::Slice *slice) {
+    if (!slice) return " slice=<null>";
+
+    std::ostringstream oss;
+    const auto *task = slice->task;
+    oss << " batch_id=" << (task ? task->batch_id : 0)
+        << " task_id=" << TaskIdForSlice(slice)
+        << " slice_status=" << SliceStatusToString(slice->status)
+        << " slice_op=" << TransferOpToString(slice->opcode)
+        << " target_id=" << slice->target_id
+        << " source_addr=" << slice->source_addr
+        << " source_lkey=" << slice->rdma.source_lkey
+        << " dest_addr=0x" << std::hex << slice->rdma.dest_addr << std::dec
+        << " dest_rkey=" << slice->rdma.dest_rkey
+        << " length=" << slice->length
+        << " retry_cnt=" << slice->rdma.retry_cnt << "/"
+        << slice->rdma.max_retry_cnt
+        << " peer_nic='" << slice->peer_nic_path << "'";
+
+    if (task) {
+        oss << " task_slices=" << task->slice_count
+            << " task_success=" << task->success_slice_count
+            << " task_failed=" << task->failed_slice_count
+            << " task_transferred_bytes=" << task->transferred_bytes
+            << " task_total_bytes=" << task->total_bytes;
+        if (task->request) {
+            oss << " request_op=" << TransferOpToString(task->request->opcode)
+                << " request_target_id=" << task->request->target_id
+                << " request_target_offset=0x" << std::hex
+                << task->request->target_offset << std::dec
+                << " request_len=" << task->request->length
+                << " request_advise_retry_cnt="
+                << task->request->advise_retry_cnt;
+        }
+    }
+    return oss.str();
+}
+
+std::string WcStatusCountsToString(
+    const std::unordered_map<int, int> &status_counts) {
+    std::ostringstream oss;
+    oss << "{";
+    bool first = true;
+    for (const auto &entry : status_counts) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << ibv_wc_status_str(static_cast<ibv_wc_status>(entry.first)) << ":"
+            << entry.second;
+    }
+    oss << "}";
+    return oss.str();
+}
+
+}  // namespace
 
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
@@ -275,7 +369,8 @@ void WorkerPool::performPostSend(int thread_id) {
                 << "/"
                 << (first_slice ? first_slice->rdma.max_retry_cnt : 0)
                 << " first_slice_peer_nic='"
-                << (first_slice ? first_slice->peer_nic_path : "") << "'";
+                << (first_slice ? first_slice->peer_nic_path : "") << "'"
+                << SliceTaskLogFields(first_slice);
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             endpoint->set_active(false);
             failed_nr_polls++;
@@ -312,6 +407,7 @@ void WorkerPool::performPollCq(int thread_id) {
     uint32_t failed_sample_vendor_err = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
+    std::unordered_map<int, int> wc_status_counts;
     for (int cq_index = thread_id; cq_index < context_.cqCount();
          cq_index += kTransferWorkerCount) {
         ibv_wc wc[kPollCount];
@@ -323,7 +419,19 @@ void WorkerPool::performPollCq(int thread_id) {
 
         for (int i = 0; i < nr_poll; ++i) {
             Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
-            assert(slice);
+            if (!slice) {
+                LOG(ERROR) << "[MC_RDMA_WC_ERROR] null slice from CQ"
+                           << " thread_id=" << thread_id
+                           << " cq_index=" << cq_index
+                           << " local_nic='" << context_.nicPath() << "'"
+                           << " wc_status_code=" << static_cast<int>(wc[i].status)
+                           << " wc_status=" << ibv_wc_status_str(wc[i].status)
+                           << " vendor_err=" << wc[i].vendor_err
+                           << " wr_id=0x" << std::hex << wc[i].wr_id << std::dec
+                           << " wc_opcode=" << static_cast<int>(wc[i].opcode)
+                           << " wc_qp_num=" << wc[i].qp_num;
+                continue;
+            }
             const int64_t completion_latency_ms =
                 slice->ts > 0
                     ? (getCurrentTimeInNano() - slice->ts) / 1000000
@@ -335,6 +443,7 @@ void WorkerPool::performPollCq(int thread_id) {
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
                 failed_cq_count++;
+                wc_status_counts[static_cast<int>(wc[i].status)]++;
                 if (wc[i].status == IBV_WC_WR_FLUSH_ERR) flush_cq_count++;
                 if (!failed_sample) {
                     failed_sample = slice;
@@ -349,20 +458,20 @@ void WorkerPool::performPollCq(int thread_id) {
                 // in work_request_flushed_error, we hide this by default
                 if (log_wc_error)
                     LOG(ERROR)
-                        << "Worker: Process failed for slice (opcode: "
-                        << slice->opcode
-                        << ", source_addr: " << slice->source_addr
-                        << ", length: " << slice->length
-                        << ", dest_addr: " << (void *)slice->rdma.dest_addr
-                        << ", local_nic: " << context_.deviceName()
-                        << ", peer_nic: " << slice->peer_nic_path
-                        << ", dest_rkey: " << slice->rdma.dest_rkey
-                        << ", retry_cnt: " << slice->rdma.retry_cnt
-                        << ", completion_latency_ms: "
+                        << "[MC_RDMA_WC_ERROR]"
+                        << " thread_id=" << thread_id
+                        << " cq_index=" << cq_index
+                        << " local_nic='" << context_.nicPath() << "'"
+                        << " wc_status_code=" << static_cast<int>(wc[i].status)
+                        << " wc_status=" << ibv_wc_status_str(wc[i].status)
+                        << " vendor_err=" << wc[i].vendor_err
+                        << " wr_id=0x" << std::hex << wc[i].wr_id << std::dec
+                        << " wc_opcode=" << static_cast<int>(wc[i].opcode)
+                        << " wc_qp_num=" << wc[i].qp_num
+                        << " completion_latency_ms="
                         << completion_latency_ms
-                        << ", vendor_err: " << wc[i].vendor_err
-                        << ", delete_endpoint: true"
-                        << "): " << ibv_wc_status_str(wc[i].status);
+                        << " delete_endpoint=true"
+                        << SliceTaskLogFields(slice);
                 failed_nr_polls++;
                 if (context_.active() && failed_nr_polls > 32 &&
                     !success_nr_polls) {
@@ -429,7 +538,9 @@ void WorkerPool::performPollCq(int thread_id) {
             << (failed_sample ? failed_sample->peer_nic_path : "")
             << "' failed_sample_status=" << failed_sample_status
             << " failed_sample_vendor_err=" << failed_sample_vendor_err
-            << " failed_sample_latency_ms=" << failed_sample_latency_ms;
+            << " failed_sample_latency_ms=" << failed_sample_latency_ms
+            << " wc_status_counts="
+            << WcStatusCountsToString(wc_status_counts);
     }
 }
 

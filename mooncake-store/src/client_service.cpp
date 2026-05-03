@@ -1628,6 +1628,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                                .buffer_descriptor.transport_endpoint_;
             }
 
+            bool ready_before_get = op.pending_transfers[i].isReady();
+            auto debug_batch_id = op.pending_transfers[i].debug_batch_id();
+            std::string debug_batch_id_str =
+                debug_batch_id ? std::to_string(*debug_batch_id) : "<none>";
             auto future_wait_start = std::chrono::steady_clock::now();
             ErrorCode transfer_result = op.pending_transfers[i].get();
             auto future_wait_elapsed_ms =
@@ -1638,8 +1642,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 LOG(ERROR)
                     << "[MC_TRANSFER_FUTURE_ERROR] key='" << op.key
                     << "' replica_idx=" << i << " endpoint='" << endpoint
-                    << "' result=" << toString(transfer_result)
+                    << "' batch_id=" << debug_batch_id_str
+                    << " result=" << toString(transfer_result)
                     << " waited_ms=" << future_wait_elapsed_ms
+                    << " ready_before_get=" << ready_before_get
                     << " pending_transfers=" << op.pending_transfers.size();
                 if (all_transfers_succeeded) {
                     // Record the first error for reporting

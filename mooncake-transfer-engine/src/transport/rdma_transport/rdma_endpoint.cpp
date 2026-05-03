@@ -59,6 +59,56 @@ const char *SliceStatusToString(Transport::Slice::SliceStatus status) {
     return "UNKNOWN";
 }
 
+const char *TransferOpToString(Transport::TransferRequest::OpCode opcode) {
+    switch (opcode) {
+        case Transport::TransferRequest::READ:
+            return "READ";
+        case Transport::TransferRequest::WRITE:
+            return "WRITE";
+    }
+    return "UNKNOWN";
+}
+
+std::string TaskIdForSlice(const Transport::Slice *slice) {
+    if (!slice || !slice->task || slice->task->batch_id == 0) return "<none>";
+    auto &batch_desc = Transport::toBatchDesc(slice->task->batch_id);
+    for (size_t i = 0; i < batch_desc.task_list.size(); ++i) {
+        if (&batch_desc.task_list[i] == slice->task) return std::to_string(i);
+    }
+    return "<unknown>";
+}
+
+std::string SliceTaskLogFields(const char *prefix,
+                               const Transport::Slice *slice) {
+    std::ostringstream oss;
+    if (!slice) {
+        oss << " " << prefix << "_slice=<null>";
+        return oss.str();
+    }
+
+    const auto *task = slice->task;
+    oss << " " << prefix << "_batch_id=" << (task ? task->batch_id : 0)
+        << " " << prefix << "_task_id=" << TaskIdForSlice(slice)
+        << " " << prefix
+        << "_slice_status=" << SliceStatusToString(slice->status)
+        << " " << prefix << "_op=" << TransferOpToString(slice->opcode)
+        << " " << prefix << "_target_id=" << slice->target_id
+        << " " << prefix << "_source_addr=" << slice->source_addr
+        << " " << prefix << "_source_lkey=" << slice->rdma.source_lkey
+        << " " << prefix << "_dest_addr=0x" << std::hex
+        << slice->rdma.dest_addr << std::dec
+        << " " << prefix << "_dest_rkey=" << slice->rdma.dest_rkey
+        << " " << prefix << "_len=" << slice->length
+        << " " << prefix << "_retry=" << slice->rdma.retry_cnt << "/"
+        << slice->rdma.max_retry_cnt;
+    if (task) {
+        oss << " " << prefix << "_task_slices=" << task->slice_count
+            << " " << prefix << "_task_success=" << task->success_slice_count
+            << " " << prefix << "_task_failed=" << task->failed_slice_count;
+    }
+    return oss.str();
+}
+
 }  // namespace
 
 const static uint8_t MAX_HOP_LIMIT = 16;
@@ -519,6 +569,7 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) {
+        auto *first_slice = slice_list.empty() ? nullptr : slice_list.front();
         LOG_EVERY_T(WARNING, 1)
             << "[MC_RDMA_POST_SEND_ERROR] inactive endpoint"
             << " local_nic='" << context_.nicPath() << "'"
@@ -526,7 +577,8 @@ int RdmaEndPoint::submitPostSend(
             << " requested=" << slice_list.size()
             << " status="
             << EndpointStatusToString(status_.load(std::memory_order_relaxed))
-            << " inactive_s=" << inactiveTime();
+            << " inactive_s=" << inactiveTime()
+            << SliceTaskLogFields("first_slice", first_slice);
         return 0;
     }
 
@@ -585,6 +637,17 @@ int RdmaEndPoint::submitPostSend(
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         auto *first_slice = wr_count > 0 ? slice_list[start] : nullptr;
         if (rc) {
+            ibv_send_wr *first_bad_wr = bad_wr;
+            int bad_wr_index = -1;
+            auto *bad_slice = first_bad_wr
+                                  ? (Transport::Slice *)first_bad_wr->wr_id
+                                  : nullptr;
+            for (int i = 0; first_bad_wr && i < wr_count; ++i) {
+                if (&wr_list[i] == first_bad_wr) {
+                    bad_wr_index = i;
+                    break;
+                }
+            }
             PLOG(ERROR) << "[MC_RDMA_POST_SEND_ERROR] ibv_post_send failed"
                         << " local_nic='" << context_.nicPath() << "'"
                         << " peer_nic='" << peer_nic_path_ << "'"
@@ -609,7 +672,12 @@ int RdmaEndPoint::submitPostSend(
                         << " first_slice_dest=0x" << std::hex
                         << (first_slice ? first_slice->rdma.dest_addr : 0)
                         << std::dec << " first_slice_rkey="
-                        << (first_slice ? first_slice->rdma.dest_rkey : 0);
+                        << (first_slice ? first_slice->rdma.dest_rkey : 0)
+                        << " bad_wr_index=" << bad_wr_index
+                        << " bad_wr_id=0x" << std::hex
+                        << (first_bad_wr ? first_bad_wr->wr_id : 0) << std::dec
+                        << SliceTaskLogFields("first_slice", first_slice)
+                        << SliceTaskLogFields("bad_slice", bad_slice);
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);

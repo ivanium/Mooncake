@@ -165,6 +165,18 @@ void DumpBatchTimeoutState(BatchID batch_id, Transport::BatchDesc& batch_desc,
                    << " sample_target_id="
                    << (first_slice ? first_slice->target_id : 0)
                    << " sample_len=" << (first_slice ? first_slice->length : 0)
+                   << " request_op="
+                   << (task.request ? TransferOpToString(task.request->opcode)
+                                    : "<null>")
+                   << " request_target_id="
+                   << (task.request ? task.request->target_id : 0)
+                   << " request_target_offset=0x" << std::hex
+                   << (task.request ? task.request->target_offset : 0)
+                   << std::dec
+                   << " request_len=" << (task.request ? task.request->length
+                                                        : 0)
+                   << " request_advise_retry_cnt="
+                   << (task.request ? task.request->advise_retry_cnt : 0)
                    << " status_counts={PENDING:"
                    << status_counts[Transport::Slice::PENDING]
                    << ", POSTED:" << status_counts[Transport::Slice::POSTED]
@@ -182,6 +194,15 @@ void DumpBatchTimeoutState(BatchID batch_id, Transport::BatchDesc& batch_desc,
             const int64_t age_ms =
                 slice->ts > 0 ? (now_ns - slice->ts) / 1000000
                               : kInvalidAgeMs;
+            std::ostringstream rdma_fields;
+            if (!slice->peer_nic_path.empty()) {
+                rdma_fields << " source_lkey=" << slice->rdma.source_lkey
+                            << " dest_addr=0x" << std::hex
+                            << slice->rdma.dest_addr << std::dec
+                            << " dest_rkey=" << slice->rdma.dest_rkey
+                            << " retry_cnt=" << slice->rdma.retry_cnt << "/"
+                            << slice->rdma.max_retry_cnt;
+            }
             LOG(ERROR) << "[MC_RDMA_TIMEOUT_DUMP]   slice_sample task_id="
                        << task_id << " status="
                        << SliceStatusToString(slice->status)
@@ -190,6 +211,7 @@ void DumpBatchTimeoutState(BatchID batch_id, Transport::BatchDesc& batch_desc,
                        << " target_id=" << slice->target_id
                        << " length=" << slice->length
                        << " source_addr=" << slice->source_addr
+                       << rdma_fields.str()
                        << " age_since_post_ms=" << age_ms;
             if (++dumped_slices >= kMaxSliceSamplesPerTask) break;
         }
@@ -633,6 +655,10 @@ ErrorCode TransferFuture::get() { return wait(); }
 
 TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
+}
+
+std::optional<BatchID> TransferFuture::debug_batch_id() const {
+    return state_->debug_batch_id();
 }
 
 // ============================================================================
