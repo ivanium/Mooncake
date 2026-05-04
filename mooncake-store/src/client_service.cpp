@@ -1621,8 +1621,32 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
         size_t failed_transfer_idx = 0;
 
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
+            std::string endpoint = "<non-memory-replica>";
+            if (i < op.replicas.size() && op.replicas[i].is_memory_replica()) {
+                endpoint = op.replicas[i]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_;
+            }
+
+            bool ready_before_get = op.pending_transfers[i].isReady();
+            auto debug_batch_id = op.pending_transfers[i].debug_batch_id();
+            std::string debug_batch_id_str =
+                debug_batch_id ? std::to_string(*debug_batch_id) : "<none>";
+            auto future_wait_start = std::chrono::steady_clock::now();
             ErrorCode transfer_result = op.pending_transfers[i].get();
+            auto future_wait_elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - future_wait_start)
+                    .count();
             if (transfer_result != ErrorCode::OK) {
+                LOG(ERROR)
+                    << "[MC_TRANSFER_FUTURE_ERROR] key='" << op.key
+                    << "' replica_idx=" << i << " endpoint='" << endpoint
+                    << "' batch_id=" << debug_batch_id_str
+                    << " result=" << toString(transfer_result)
+                    << " waited_ms=" << future_wait_elapsed_ms
+                    << " ready_before_get=" << ready_before_get
+                    << " pending_transfers=" << op.pending_transfers.size();
                 if (all_transfers_succeeded) {
                     // Record the first error for reporting
                     first_error = transfer_result;
