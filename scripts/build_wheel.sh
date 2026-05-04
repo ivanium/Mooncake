@@ -15,8 +15,11 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 BUILD_DIR="${BUILD_DIR:-build}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
-# Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-common:/usr/local/lib
+# auditwheel resolves grafted libs via the dynamic linker; make sure the local
+# build outputs and the deps prefix are reachable. MOONCAKE_DEPS_DIR can be
+# overridden to match wherever dev_compile.sh installed/built deps.
+MOONCAKE_DEPS_DIR="${MOONCAKE_DEPS_DIR:-$HOME/.local/mooncake-deps}"
+export LD_LIBRARY_PATH="$(pwd)/build/mooncake-common:$MOONCAKE_DEPS_DIR/lib:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -170,18 +173,30 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-if command -v pip &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
-elif command -v uv &>/dev/null; then
-    uv pip install --upgrade pip
+# Prefer uv: it can target uv-managed / PEP-668 pythons via a throwaway venv
+# (those pythons are read-only; `pip install` against them fails). Fall back
+# to plain pip when uv isn't available.
+if command -v uv &>/dev/null; then
+    BUILD_VENV_DIR="$(pwd)/.wheel-build-venv-${PYTHON_VERSION}"
+    # Unset VIRTUAL_ENV so uv binds to the requested python rather than any
+    # stale active venv inherited from the user's shell.
+    env -u VIRTUAL_ENV uv venv --clear --python "python${PYTHON_VERSION}" "$BUILD_VENV_DIR"
+    # Activate so subsequent `python${PYTHON_VERSION}` and `auditwheel` calls
+    # in this script resolve to the venv binaries.
+    # shellcheck source=/dev/null
+    . "$BUILD_VENV_DIR/bin/activate"
     uv pip install build setuptools wheel auditwheel
+elif command -v pip &>/dev/null; then
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
 else
-    echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
+    echo "Error: Neither pip nor uv found"
     exit 1
 fi
 
-# Create directory for repaired wheels
+# Create directory for repaired wheels (clean any stale wheels from a prior
+# failed run so they don't get moved into dist/ alongside the new wheel).
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
+rm -rf ${REPAIRED_DIR}
 mkdir -p ${REPAIRED_DIR}
 
 # Detect architecture and glibc version for platform tag
