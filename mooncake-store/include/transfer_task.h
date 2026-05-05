@@ -402,11 +402,18 @@ class TransferSubmitter {
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code);
 
+    // Multi-slice variant: each key may have multiple destination slices,
+    // which are packed sequentially against the owner-side `pointer` (so
+    // slice[j] reads from `pointer + sum(sizes[0..j-1])`). This lets the
+    // worker scatter a contiguous on-disk blob into non-contiguous local
+    // buffers (e.g. vLLM's per-layer KV cache slabs) without an
+    // intermediate temp buffer.
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices);
 
    private:
     TransferEngine& engine_;
